@@ -1,0 +1,37 @@
+{
+  "name": "@deepseek-ai/dsh-experimental-massai-bundle",
+  "description": "Massai bundle: cost-aware model routing, presets, and the cai tool for the Massai fork of DSH.",
+  "version": "0.2.2-rc.4",
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BlunT4TnulB/massai-dsh.git",
+    "directory": "packages/experimental/massai-bundle"
+  },
+  "type": "module",
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": [
+        "./cordis.patch.yml",
+        "./presets/massai.patch.yml",
+        "./presets/cheap.patch.yml"
+      ]
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-agent-default-model": "workspace:*",
+    "@deepseek-ai/dsh-account-connect": "workspace:*",
+    "@deepseek-ai/dsh-tool-cai": "workspace:*",
+    "@deepseek-ai/dsh-tool-sync": "workspace:*",
+    "@deepseek-ai/dsh-tool-sqlite": "workspace:*",
+    "@deepseek-ai/dsh-tool-http": "workspace:*",
+    "@deepseek-ai/dsh-user-credentials": "workspace:*",
+    "@deepseek-ai/dsh-model-router": "workspace:*"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "workspace:~"
+  }
+}

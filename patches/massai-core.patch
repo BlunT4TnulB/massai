@@ -1,0 +1,204 @@
+diff --git a/packages/account/deepseek-auth/src/index.ts b/packages/account/deepseek-auth/src/index.ts
+index ba2a4d6a..42072221 100644
+--- a/packages/account/deepseek-auth/src/index.ts
++++ b/packages/account/deepseek-auth/src/index.ts
+@@ -217,12 +217,21 @@ export class DeepSeekAuth extends Service {
+     const { ctx } = this
+     const reference = connection.reference ?? DEEPSEEK_API_KEY
+     const owner = connection.owner ?? request.consumer
++    const userId = request.userId
++    const userCredentials = userId === undefined ? undefined
++      : ctx.get('userCredentials') as { resolveFor(userId: string): Promise<string | undefined> } | undefined
+     return {
+       kind: 'api-key', endpoint, reference,
+-      configured: () => credentialRefConfigured(ctx, reference),
++      configured: async () => userCredentials === undefined
++        ? credentialRefConfigured(ctx, reference)
++        : await userCredentials.resolveFor(userId!) !== undefined,
+       resolve: async (signal) => {
+         signal?.throwIfAborted()
+-        const raw = await resolveCredentialRef(ctx, reference)
++        let raw: string | undefined
++        if (userCredentials !== undefined) {
++          raw = await userCredentials.resolveFor(userId!)
++        }
++        raw ??= await resolveCredentialRef(ctx, reference)
+         if (raw === undefined) return undefined
+         const checked = normalizeApiKey(raw)
+         if (!checked.ok) throw new DeepSeekAuthError(unusableKey(checked.reason, owner, reference), 'INVALID_CREDENTIAL')
+diff --git a/packages/account/deepseek-auth/src/types.ts b/packages/account/deepseek-auth/src/types.ts
+index e0579763..8c7057fa 100644
+--- a/packages/account/deepseek-auth/src/types.ts
++++ b/packages/account/deepseek-auth/src/types.ts
+@@ -52,6 +52,11 @@ export interface DeepSeekAuthRequest {
+   readonly connections?: Readonly<Partial<Record<DeepSeekAuthKind, DeepSeekAuthConnection>>>
+   /** Headers an API key is sent in; `authorization` when omitted. The account sign-in chooses its own header. */
+   readonly apiKeyHeaders?: readonly DeepSeekApiKeyHeader[]
++  /**
++   * Hosted link only: the signed-in user id. When set and a `userCredentials` service is mounted, the API key is
++   * resolved per-user; otherwise the global reference is used (unchanged local behavior).
++   */
++  readonly userId?: string
+ }
+ 
+ /** The credential of one kind released for one request, ready to send. */
+diff --git a/packages/core/agent-loop/src/agent.ts b/packages/core/agent-loop/src/agent.ts
+index 7ec43dd1..4656694d 100644
+--- a/packages/core/agent-loop/src/agent.ts
++++ b/packages/core/agent-loop/src/agent.ts
+@@ -447,8 +447,11 @@ export class ReactLoopAgent implements Agent {
+     const { assembly } = decision
+     const renderedPrompt = renderPrompt(assembly)
+     let firstAttempt = true
++    let retryModel: string | undefined
+     while (true) {
+       const { config, preparedCall } = await this.prepareRequest(turn, step, decision.selection, signal)
++      const effectiveConfig = retryModel === undefined ? config : { ...config, model: retryModel }
++      retryModel = undefined
+       const currentContext = this.loopCtx.systemPrompt.refreshContext(assembly, {
+         ...assembleContextFor(this, signal), modelSelection: decision.selection,
+       })
+@@ -482,7 +485,7 @@ export class ReactLoopAgent implements Agent {
+         this.session.append('user/message', context, { surfaceOp: 'append' })
+       }
+       firstAttempt = false
+-      const request = this.buildRequest(config, preparedCall, assembly.tools, { turn, step }, startsRequestSeries, signal)
++      const request = this.buildRequest(effectiveConfig, preparedCall, assembly.tools, { turn, step }, startsRequestSeries, signal)
+       const live = new AssistantStreamAttempt(
+         this.session.id,
+         ++this.assistantAttemptCounter,
+@@ -566,6 +569,7 @@ export class ReactLoopAgent implements Agent {
+           if (action?.kind !== 'retry') {
+             throw LlmError.fromFailure(finish.failure)
+           }
++          if (action.model !== undefined) retryModel = action.model
+           continue
+         }
+ 
+diff --git a/packages/core/agent/src/runtime-types.ts b/packages/core/agent/src/runtime-types.ts
+index 7012dfdf..ab54e223 100644
+--- a/packages/core/agent/src/runtime-types.ts
++++ b/packages/core/agent/src/runtime-types.ts
+@@ -146,7 +146,7 @@ export type PreStepDecision =
+   }
+ 
+ /** Action returned by a listener that owns model-request recovery. */
+-export type RequestErrorAction = { kind: 'retry' } | undefined
++export type RequestErrorAction = { kind: 'retry'; model?: string } | undefined
+ 
+ /** Why a session lifecycle began; seeded creates are `startup`, while persisted loads are `resume`. */
+ export type SessionStartSource = 'startup' | 'resume' | 'clear' | 'compact'
+diff --git a/packages/llm/llm-deepseek/src/models.ts b/packages/llm/llm-deepseek/src/models.ts
+index c25d5111..17d85893 100644
+--- a/packages/llm/llm-deepseek/src/models.ts
++++ b/packages/llm/llm-deepseek/src/models.ts
+@@ -9,6 +9,7 @@ export const DEFAULT_MODELS: DeepSeekCatalogModel[] = [
+   {
+     id: 'deepseek-flash',
+     name: 'DeepSeek-V4.1-Flash',
++    description: 'Fast, cheap DeepSeek tier for routine, latency-sensitive, or high-volume work; strongest value per token.',
+     contextWindow: OFFICIAL_CONTEXT_WINDOW,
+     inputModalities: ['text', 'image'],
+     systemPromptUpdate: 'in-history',
+diff --git a/packages/llm/llm-retry/src/index.ts b/packages/llm/llm-retry/src/index.ts
+index 71686625..8e616967 100644
+--- a/packages/llm/llm-retry/src/index.ts
++++ b/packages/llm/llm-retry/src/index.ts
+@@ -71,6 +71,7 @@ function retryPolicyKey(policy: ResolvedRetryPolicy): string {
+       policy.mode,
+       policy.maxRetries,
+       [...policy.retryableCodes].sort(),
++      policy.fallbackModel,
+       policy.initialDelayMs,
+       policy.maxDelayMs,
+       policy.jitterRatio,
+@@ -185,7 +186,10 @@ export async function apply(ctx: Context, config: Config = {}, internals: RetryI
+     agent.session.append('llm/retry', eventData)
+     if (!await cancellableDelay(delayMs, fusedSignal)) return
+     agent.session.append('llm/retry-started', { retryId, turn, step, retry })
+-    return { kind: 'retry' }
++    const fallbackModel = policy.mode === 'normal' ? policy.fallbackModel : undefined
++    return fallbackModel !== undefined
++      ? { kind: 'retry', model: fallbackModel }
++      : { kind: 'retry' }
+   }
+ 
+   async function recover(
+diff --git a/packages/llm/llm/src/retry-policy.ts b/packages/llm/llm/src/retry-policy.ts
+index fc7beb84..beae8407 100644
+--- a/packages/llm/llm/src/retry-policy.ts
++++ b/packages/llm/llm/src/retry-policy.ts
+@@ -44,6 +44,8 @@ export interface NormalRetryPolicyConfig {
+   retryableCodes?: string[]
+   /** Local exponential-backoff and jitter configuration. */
+   backoff?: BackoffConfig
++  /** Fallback model id to use for retries when configured (e.g. deepseek-flash). */
++  fallbackModel?: string
+ }
+ 
+ /** Unbounded retry behavior for every model-request failure on one provider route. */
+@@ -69,6 +71,7 @@ export interface ResolvedNormalRetryPolicy extends ResolvedRetryBackoff {
+   readonly mode: 'normal'
+   readonly maxRetries: number
+   readonly retryableCodes: readonly string[]
++  readonly fallbackModel?: string
+ }
+ 
+ /** Fully resolved unbounded retry policy. */
+@@ -95,6 +98,7 @@ const normalPolicySchema: z<NormalRetryPolicyConfig> = z.object({
+   retryableCodes: z.array(z.union([...RETRY_CODE_CHOICES.map(code => z.const(code)), z.string().min(1)]))
+     .min(1).default([...DEFAULT_RETRYABLE_CODES]),
+   backoff: backoffSchema,
++  fallbackModel: z.string(),
+ })
+ 
+ const alwaysPolicySchema: z<AlwaysRetryPolicyConfig> = z.object({
+@@ -109,12 +113,12 @@ export const RetryPolicySchema: z<RetryPolicyConfig> = z.union([
+ ])
+ 
+ const NORMAL_POLICY_KEYS: ReadonlySet<string> = new Set([
+-  'mode', 'maxRetries', 'retryableCodes', 'backoff',
++  'mode', 'maxRetries', 'retryableCodes', 'backoff', 'fallbackModel',
+ ])
+ // Layered configuration can retain normal-only fields after switching modes;
+ // always mode ignores those inactive values while still rejecting unknown keys.
+ const ALWAYS_POLICY_KEYS: ReadonlySet<string> = new Set([
+-  'mode', 'maxRetries', 'retryableCodes', 'backoff',
++  'mode', 'maxRetries', 'retryableCodes', 'backoff', 'fallbackModel',
+ ])
+ const BACKOFF_KEYS: ReadonlySet<string> = new Set(['initialDelayMs', 'maxDelayMs', 'jitterRatio'])
+ 
+@@ -182,10 +186,15 @@ export function resolveRetryPolicy(
+       if (new Set(retryableCodes).size !== retryableCodes.length) {
+         throw new Error(`${path}.retryableCodes must not contain duplicates`)
+       }
++      const fallbackModel = config.fallbackModel
++      if (fallbackModel !== undefined && fallbackModel.length === 0) {
++        throw new Error(`${path}.fallbackModel must not be empty`)
++      }
+       return Object.freeze({
+         mode: 'normal',
+         maxRetries,
+         retryableCodes: Object.freeze([...retryableCodes]),
++        ...(fallbackModel !== undefined ? { fallbackModel } : {}),
+         ...resolveBackoff(config.backoff, `${path}.backoff`),
+       })
+     }
+diff --git a/tsconfig.base.json b/tsconfig.base.json
+index b87f4bee..87fbb52a 100644
+--- a/tsconfig.base.json
++++ b/tsconfig.base.json
+@@ -47,6 +47,13 @@
+       "@deepseek-ai/dsh-experimental-ralph-bundle": ["./packages/experimental/ralph-bundle/src/index.ts"],
+       "@deepseek-ai/dsh-experimental-terminal-bundle": ["./packages/experimental/terminal-bundle/src/index.ts"],
+       "@deepseek-ai/dsh-experimental-badge-skill-bundle": ["./packages/experimental/badge-skill-bundle/src/index.ts"],
++      "@deepseek-ai/dsh-model-router": ["./packages/experimental/model-router/src/index.ts"],
++      "@deepseek-ai/dsh-tool-cai": ["./packages/experimental/tool-cai/src/index.ts"],
++      "@deepseek-ai/dsh-tool-sync": ["./packages/experimental/tool-sync/src/index.ts"],
++      "@deepseek-ai/dsh-account-connect": ["./packages/experimental/account-connect/src/index.ts"],
++      "@deepseek-ai/dsh-tool-sqlite": ["./packages/experimental/tool-sqlite/src/index.ts"],
++      "@deepseek-ai/dsh-tool-http": ["./packages/experimental/tool-http/src/index.ts"],
++      "@deepseek-ai/dsh-user-credentials": ["./packages/experimental/user-credentials/src/index.ts"],
+       "@deepseek-ai/dsh-experimental-session-titles-bundle": ["./packages/experimental/session-titles-bundle/src/index.ts"],
+       "@deepseek-ai/dsh-client-product-analytics": ["./packages/client/product-analytics/src/index.ts"],
+       "@deepseek-ai/dsh-client-product-analytics/types": ["./packages/client/product-analytics/src/events.ts"],
